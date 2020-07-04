@@ -175,7 +175,35 @@
    (shell-thread
      :accessor kernel-shell-thread
      :initform nil
-     :documentation "Shell thread"))
+     :documentation "Shell thread")
+   (tmp-file-prefix
+     :accessor kernel-tmp-file-prefix
+     :documentation "Prefix for temporary debugger files")
+   (tmp-file-suffix
+     :accessor kernel-tmp-file-suffix
+     :documentation "Suffix for temporary debugger files")
+   (hash-seed
+     :accessor kernel-hash-seed
+     :documentation "Hash seed for temporary debugger files")
+   (breakpoints
+     :accessor kernel-breakpoints
+     :initform nil
+     :documentation "Currently set breakpoints.")
+   (debugger-started
+     :accessor kernel-debugger-started
+     :initform nil
+     :documentation "Whether the debugger has been started")
+   (thread-control-queues
+     :accessor kernel-thread-control-queues
+     :initform (make-hash-table)
+     :documentation "CONTROL message queues for threads")
+   (debug-objects
+     :reader kernel-debug-objects
+     :initform (make-hash-table)
+     :documentation "Kernel frames")
+   (debug-object-id
+     :accessor kernel-debug-object-id
+     :initform 0))
   (:documentation "Kernel state representation."))
 
 (defgeneric evaluate-code (kernel code)
@@ -206,12 +234,83 @@
 
 (defmethod complete-code (kernel match-set code cursor-pos))
 
+(defgeneric debug-initialize (kernel)
+  (:documentation ""))
+
+(defgeneric debug-continue (kernel environment)
+  (:documentation ""))
+
+(defgeneric debug-in (kernel environment)
+  (:documentation ""))
+
+(defgeneric debug-out (kernel environment)
+  (:documentation ""))
+
+(defgeneric debug-next (kernel environment)
+  (:documentation ""))
+
+(defgeneric debug-stack-trace (kernel environment)
+  (:documentation ""))
+
+(defgeneric debug-scopes (kernel environment frame)
+  (:documentation ""))
+
+(defgeneric debug-set-breakpoint (kernel source line column condition hit-condition log-message)
+  (:documentation ""))
+
+
+(defun add-debug-object (kernel object &key (thread-id 1))
+  (incf (kernel-debug-object-id kernel))
+  (setf (gethash (kernel-debug-object-id kernel) (kernel-debug-objects kernel))
+        (list object thread-id))
+  (kernel-debug-object-id kernel))
+
+
+(defun remove-debug-object (kernel id)
+  (remhash id (kernel-debug-objects kernel)))
+
+
+(defun get-debug-object (kernel id)
+  (values-list (gethash id (kernel-debug-objects kernel))))
+
+
+(defun debug-stop (kernel reason environment &key (thread-id 1))
+  (let ((msg-queue (make-instance 'queue)))
+    (setf (gethash thread-id (kernel-thread-control-queues kernel)) msg-queue)
+    (send-execute-reply-ok (kernel-shell kernel) *message* (history-execution-count kernel) nil)
+    (send-debug-event (kernel-iopub kernel) "stopped"
+                      (json-new-obj
+                        ("reason" reason)
+                        ("threadId" thread-id)))
+    (prog (msg)
+     wait
+      (setq msg (dequeue msg-queue))
+      (send-status-update (kernel-iopub kernel) msg "busy")
+      (switch ((json-getf (message-content msg) "command") :test #'equal)
+        ("continue"
+          (handle-debug-request/continue kernel msg environment))
+        ("disconnect"
+          (return))
+        ("stepIn"
+          (handle-debug-request/step-in kernel msg environment))
+        ("stepOut"
+          (handle-debug-request/step-out kernel msg environment))
+        ("next"
+          (handle-debug-request/next kernel msg environment))
+        ("scopes"
+          (handle-debug-request/scopes kernel msg environment))
+        ("stackTrace"
+          (handle-debug-request/stack-trace kernel msg environment)))
+      (send-status-update (kernel-iopub kernel) msg "idle")
+      (go wait))))
+
+
 ;; Start all channels.
 (defmethod start ((k kernel))
   (with-slots (connection-file control-port ctx hb hb-port history iopub request-queue
                iopub-port ip key language-name mac name prompt-prefix prompt-suffix
                session shell shell-port signature-scheme sink stdin stdin-port control
-               transport)
+               transport tmp-file-prefix tmp-file-suffix hash-seed file-extension)
               k
     (setf sink (make-instance 'sink
                               :path (uiop:xdg-runtime-dir
@@ -235,8 +334,11 @@
                   nil
                   (babel:string-to-octets encoded-key :encoding :ASCII))
             signature-scheme (json-getf config-js "signature_scheme")))
-    (setf *uuid-random-state* (make-random-state t)
+    (setq *uuid-random-state* (make-random-state t)
           session (make-uuid)
+          hash-seed (random #xffffffff *uuid-random-state*)
+          tmp-file-prefix (namestring (merge-pathnames (uiop:default-temporary-directory) (format nil "~A-~A-" name session)))
+          tmp-file-suffix file-extension
           ctx (pzmq:ctx-new)
           mac (make-instance 'mac
                              :sink sink
@@ -303,6 +405,7 @@
           (bordeaux-threads:make-thread (lambda ()
                                           (run-shell k))
                                         :name "SHELL Thread"))))
+
 
 ;; Stop all channels and destroy the control.
 (defmethod stop ((k kernel))
@@ -399,7 +502,6 @@
          (invoke-restart-interactively (nth choice applicable-restarts))))))
 
 
-
 (defmacro handling-errors (&body body)
   "Macro for catching any conditions including quit-conditions during code
   evaluation."
@@ -428,11 +530,14 @@
 
 
 (defmacro debugging-errors (&body body)
-  `(if *debugger*
-     (let ((*debugger-hook* #'my-debugger))
-       (with-simple-restart (exit "Exit debugger, returning to top level.")
-         ,@body))
-     (handling-errors ,@body)))
+  `(let ((#+sbcl sb-ext:*invoke-debugger-hook* #-sbcl *debugger-hook* #'my-debugger))
+       (with-simple-restart (abort "Exit debugger, returning to top level.")
+         ,@body)))
+  ; `(if *debugger*
+  ;    (let ((*debugger-hook* #'my-debugger))
+  ;      (with-simple-restart (exit "Exit debugger, returning to top level.")
+  ;        ,@body))
+  ;    (handling-errors ,@body)))
 
 (defmacro handling-comm-errors (&body body)
   "Macro for catching any conditions including quit-conditions during code
@@ -464,20 +569,49 @@
                           (json-getf (message-content msg) "command")))
         (*kernel* kernel)
         (*message* msg))
-    (unwind-protect
-        (progn
-          (send-status-update (kernel-iopub kernel) msg "busy")
-          (switch (msg-type :test #'equal)
-            ("interrupt_request"
-              (handle-interrupt-request kernel msg)
-              t)
-            ("shutdown_request"
-              (handle-shutdown-request kernel msg)
-              nil)
-            (otherwise
-              (inform :warn kernel "Ignoring ~A message since there is no appropriate handler." msg-type)
-              t)))
-      (send-status-update (kernel-iopub kernel) msg "idle"))))
+    (cond
+      ((member msg-type '("debug_request/continue" "debug_request/next" "debug_request/stackTrace"
+                          "debug_request/stepIn" "debug_request/stepOut")
+               :test #'equal)
+        (let ((msg-queue (gethash (json-getf (json-getf (message-content msg) "arguments") "threadId") (kernel-thread-control-queues kernel))))
+          (enqueue msg-queue msg))
+        t)
+      ((member msg-type '("debug_request/scopes") :test #'equal)
+        (let* ((thread-id (nth-value 1 (get-debug-object kernel (json-getf (json-getf (message-content msg) "arguments") "frameId"))))
+               (msg-queue (gethash thread-id (kernel-thread-control-queues kernel))))
+          (enqueue msg-queue msg))
+        t)
+      (t
+        (unwind-protect
+            (progn
+              (send-status-update (kernel-iopub kernel) msg "busy")
+              (switch (msg-type :test #'equal)
+                ("interrupt_request"
+                  (handle-interrupt-request kernel msg)
+                  t)
+                ("shutdown_request"
+                  (handle-shutdown-request kernel msg)
+                  nil)
+                ("debug_request/attach"
+                  (handle-debug-request/attach kernel msg))
+                ("debug_request/configurationDone"
+                  (handle-debug-request/configuration-done kernel msg))
+                ("debug_request/debugInfo"
+                  (handle-debug-request/debug-info kernel msg))
+                ("debug_request/disconnect"
+                  (handle-debug-request/disconnect kernel msg))
+                ("debug_request/dumpCell"
+                  (handle-debug-request/dump-cell kernel msg))
+                ("debug_request/initialize"
+                  (handle-debug-request/initialize kernel msg))
+                ("debug_request/setBreakpoints"
+                  (handle-debug-request/set-breakpoints kernel msg))
+                ("debug_request/source"
+                  (handle-debug-request/source kernel msg))
+                (otherwise
+                  (inform :warn kernel "Ignoring ~A message since there is no appropriate handler." msg-type)
+                  t)))
+          (send-status-update (kernel-iopub kernel) msg "idle"))))))
 
 #|
 
@@ -537,6 +671,7 @@
           ("implementation" name)
           ("implementation_version" version)
           ("banner" banner)
+          ("debugger" :true)
           ("help_links"
             (mapcar
               (lambda (p)
@@ -552,6 +687,233 @@
               ("codemirror_mode" codemirror-mode))))
       :parent msg)))
   t)
+
+#|
+
+### Message type: debug_request / attach ###
+
+|#
+
+(defun handle-debug-request/attach (kernel msg)
+  (inform :info kernel "Handling debug_request/attach message ~S" (message-content msg))
+  (send-debug-reply (kernel-control kernel) msg)
+  t)
+
+
+#|
+
+### Message type: debug_request / configurationDone ###
+
+|#
+
+(defun handle-debug-request/configuration-done (kernel msg)
+  (inform :info kernel "Handling debug_request/configurationDone message ~S" (message-content msg))
+  (send-debug-reply (kernel-control kernel) msg)
+  t)
+
+
+#|
+
+### Message type: debug_request / continue ###
+
+|#
+
+(defun handle-debug-request/continue (kernel msg environment)
+  (inform :info kernel "Handling debug_request/continue message ~S" (message-content msg))
+  (send-debug-reply (kernel-control kernel) msg)
+  (send-debug-event (kernel-iopub kernel) "continued")
+  (debug-continue kernel environment)
+  t)
+
+
+#|
+
+### Message type: debug_request / debugInfo ###
+
+|#
+
+(defun handle-debug-request/debug-info (kernel msg)
+  (inform :info kernel "Handling debug_request/debugInfo message")
+  (send-debug-reply (kernel-control kernel) msg
+    (json-new-obj
+      ("isStarted" (if (kernel-debugger-started kernel) :true :false))
+      ("hashMethod" "Murmur2")
+      ("hashSeed" (kernel-hash-seed kernel))
+      ("tmpFilePrefix" (kernel-tmp-file-prefix kernel))
+      ("tmpFileSuffix" (kernel-tmp-file-suffix kernel))
+      ("breakpoints" (kernel-breakpoints kernel))))
+  t)
+
+
+#|
+
+### Message type: debug_request / disconnect ###
+
+|#
+
+(defun handle-debug-request/disconnect (kernel msg)
+  (inform :info kernel "Handling debug_request/disconnect message")
+  (when (json-getf (json-getf (message-content msg) "arguments") "terminateDebuggee")
+    (setf (kernel-debugger-started kernel) nil)
+    (maphash (lambda (thread-id msg-queue)
+               (enqueue msg-queue msg))
+             (kernel-thread-control-queues kernel))
+    (clrhash (kernel-thread-control-queues kernel)))
+  (send-debug-reply (kernel-control kernel) msg)
+  t)
+
+
+#|
+
+### Message type: debug_request / dumpCell ###
+
+|#
+
+(defun handle-debug-request/dump-cell (kernel msg)
+  (inform :info kernel "Handling debug_request/dumpCell message")
+  (let* ((data (babel:string-to-octets (json-getf (json-getf (message-content msg) "arguments") "code")))
+         (hash (murmur-hash-2 data (kernel-hash-seed kernel)))
+         (source-path (format nil "~A~A~A" (kernel-tmp-file-prefix kernel) hash (kernel-tmp-file-suffix kernel))))
+    (with-open-file (stream source-path :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
+      (write-sequence data stream))
+    (send-debug-reply (kernel-control kernel) msg
+      (json-new-obj
+        ("sourcePath" source-path))))
+  t)
+
+
+#|
+
+### Message type: debug_request / initialize ###
+
+|#
+
+(defun handle-debug-request/initialize (kernel msg)
+  (inform :info kernel "Handling debug_request/initialize message ~S" (message-content msg))
+  (send-debug-reply (kernel-control kernel) msg
+    (debug-initialize kernel))
+  (setf (kernel-debugger-started kernel) t)
+  (send-debug-event (kernel-iopub kernel) "initialized")
+  t)
+
+
+#|
+
+### Message type: debug_request / next ###
+
+|#
+
+(defun handle-debug-request/next (kernel msg environment)
+  (inform :info kernel "Handling debug_request/next message ~S" (message-content msg))
+  (send-debug-reply (kernel-control kernel) msg)
+  (debug-next kernel environment)
+  t)
+
+
+#|
+
+### Message type: debug_request / scopes ###
+
+|#
+
+(defun handle-debug-request/scopes (kernel msg environment)
+  (inform :info kernel "Handling debug_request/scopes message ~S" (message-content msg))
+  (send-debug-reply (kernel-control kernel) msg
+                    (json-new-obj
+                      ("scopes" (debug-scopes kernel environment
+                                              (get-debug-object kernel (json-getf (json-getf (message-content msg) "arguments") "frameId"))))))
+  t)
+
+
+#|
+
+### Message type: debug_request / setBreakpoints ###
+
+|#
+
+(defun handle-debug-request/set-breakpoints (kernel msg)
+  (inform :info kernel "Handling debug_request/setBreakpoints message ~S" (message-content msg))
+  (let* ((nbp (json-getf (message-content msg) "arguments"))
+         (source-path (json-getf (json-getf nbp "source") "path"))
+         (breakpoints (mapcar (lambda (breakpoint)
+                                (debug-set-breakpoint kernel source-path
+                                                      (json-getf breakpoint "line")
+                                                      (json-getf breakpoint "column")
+                                                      (json-getf breakpoint "condition")
+                                                      (json-getf breakpoint "hitCondition")
+                                                      (json-getf breakpoint "logMessage")))
+                              (json-getf nbp "breakpoints"))))
+    (setf (kernel-breakpoints kernel)
+          (append breakpoints
+                  (delete-if (lambda (breakpoint)
+                               (equal source-path
+                                      (json-getf (json-getf breakpoint "source") "path")))
+                             (kernel-breakpoints kernel))))
+    (send-debug-reply (kernel-control kernel) msg
+      (json-new-obj
+        ("breakpoints" breakpoints))))
+  t)
+
+
+#|
+
+### Message type: debug_request / source ###
+
+|#
+
+(defun handle-debug-request/source (kernel msg)
+  (inform :info kernel "Handling debug_request/source message ~S" (message-content msg))
+  (handler-case
+      (send-debug-reply (kernel-control kernel) msg
+        (json-new-obj
+          ("content" (alexandria:read-file-into-string (json-getf (json-getf (json-getf (message-content msg) "arguments") "source") "path")))
+          ("mimeType" (kernel-mime-type kernel))))
+    (error (err)
+      (send-debug-reply-failure (kernel-control kernel) msg "Unable to load source")))
+  t)
+
+
+#|
+
+### Message type: debug_request / stackTrace ###
+
+|#
+
+(defun handle-debug-request/stack-trace (kernel msg environment)
+  (inform :info kernel "Handling debug_request/stackTrace message ~S" (message-content msg))
+  (send-debug-reply (kernel-control kernel) msg
+                    (json-new-obj
+                      ("stackFrames" (debug-stack-trace kernel environment))))
+  t)
+
+
+#|
+
+### Message type: debug_request / stepIn ###
+
+|#
+
+(defun handle-debug-request/step-in (kernel msg environment)
+  (inform :info kernel "Handling debug_request/stepIn message ~S" (message-content msg))
+  (send-debug-reply (kernel-control kernel) msg)
+  (send-debug-event (kernel-iopub kernel) "stopped")
+  (debug-in kernel environment)
+  t)
+
+
+#|
+
+### Message type: debug_request / stepOut ###
+
+|#
+
+(defun handle-debug-request/step-out (kernel msg environment)
+  (inform :info kernel "Handling debug_request/stepOut message ~S" (message-content msg))
+  (send-debug-reply (kernel-control kernel) msg)
+  (send-debug-event (kernel-iopub kernel) "stopped")
+  (debug-out kernel environment)
+  t)
+
 
 #|
 
