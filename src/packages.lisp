@@ -39,30 +39,44 @@
     #:match-set-add
     #:make-offset-match-set
     ; kernel
-    #:*page-output*
+    #:add-debug-object
     #:clear
     #:code-is-complete
     #:comm
     #:comm-id
     #:complete-code
     #:create-comm
+    #:debug-continue
     #:*debugger*
     #:debugging-errors
+    #:debug-initialize
+    #:debug-in
+    #:debug-out
+    #:debug-next
+    #:debug-scopes
+    #:debug-set-breakpoint
+    #:debug-stack-trace
+    #:debug-stop
     #:enqueue-input
     #:evaluate-code
+    #:get-comm
+    #:get-debug-object
     #:handling-errors
     #:inform
     #:inspect-code
+    #:*kernel*
     #:kernel
     #:kernel-prompt-prefix
+    #:kernel-debugger-started
     #:kernel-prompt-suffix
     #:make-uuid
     #:on-comm-close
     #:on-comm-message
     #:on-comm-open
+    #:*page-output*
     #:quit-condition
+    #:remove-debug-object
     #:run-kernel
-    #:get-comm
     #:send-comm-close
     #:send-comm-message
     #:send-comm-open
