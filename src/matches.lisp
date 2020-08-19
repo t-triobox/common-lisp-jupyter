@@ -43,7 +43,7 @@
           (dolist (m (match-set-matches ms))
             (setf (match-text m)
                   (concatenate 'string prefix (match-text m) suffix))))))
-    (push m (match-set-matches ms))))
+    (pushnew m (match-set-matches ms) :test #'string= :key #'match-text)))
 
 
 (defmethod match-set-add ((ms offset-match-set) text start end &key type)

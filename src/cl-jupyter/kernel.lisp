@@ -47,7 +47,9 @@
     ((jupyter:kernel-debugger-started jupyter:*kernel*)
       (format *error-output* "[~S] ~A~%" (type-of condition) condition)
       (finish-output *error-output*)
-      (jupyter:debug-stop jupyter:*kernel* "exception" (dissect:capture-environment condition)))
+      (conium:call-with-debugging-environment
+        (lambda ()
+          (jupyter:debug-stop jupyter:*kernel* "exception" (dissect:capture-environment condition)))))
     (t
       (dissect:present condition *error-output*)
       (finish-output *error-output*)))
@@ -88,16 +90,19 @@
 
 
 (defmethod jupyter:debug-stack-trace ((k kernel) environment)
-  (mapcar (lambda (call)
-            (jupyter:json-new-obj
-              ("id" (jupyter:add-debug-object k call))
-              ("name" (format nil "~S" (dissect:call call)))
-              ("source" (jupyter:json-new-obj
-                          ("name" (or (dissect:file call) :null))
-                          ("path" (or (dissect:file call) :null))))
-              ("line" (or (dissect:line call) 0))
-              ("column" 0)))
-          (dissect:environment-stack environment)))
+  (let (results)
+    (jupyter::dolist* (frame-number frame (conium:compute-backtrace 0 nil) (nreverse results))
+      ;(format :error k "~S" (conium:frame-source-location-for-emacs frame-number))
+                     (push (jupyter:json-new-obj
+                             ("id" (jupyter:add-debug-object k frame))
+                             ("name" (with-output-to-string (s)
+                                       (conium:print-frame frame s)))
+                             ("source" (jupyter:json-new-obj
+                                          ("name" "foo")
+                                          ("path" "foo")))
+                             ("line" 0)
+                             ("column" 0))
+                           results))))
 
 
 (defmethod jupyter:debug-initialize ((k kernel))
@@ -135,20 +140,21 @@
     (read input-stream eof-error-p eof-value recursive-p)))
 
 (defun my-eval (expr)
-  (debugging-errors
-    (setq common-lisp-user::- expr)
-    (let ((evaluated-expr (multiple-value-list #+sbcl (eval `(step ,expr))
-                                               #-sbcl (eval expr))))
-      (setq common-lisp-user::*** common-lisp-user::**
-            common-lisp-user::** common-lisp-user::*
-            common-lisp-user::* (car evaluated-expr)
-            common-lisp-user::/// common-lisp-user:://
-            common-lisp-user::// common-lisp-user::/
-            common-lisp-user::/ evaluated-expr
-            common-lisp-user::+++ common-lisp-user::++
-            common-lisp-user::++ common-lisp-user::+
-            common-lisp-user::+ expr)
-      (remove nil (mapcar #'jupyter:make-lisp-result evaluated-expr)))))
+  (setq common-lisp-user::- expr)
+  (let ((evaluated-expr (multiple-value-list (conium:call-with-debugger-hook #'my-debugger
+                                                                             (lambda ()
+                                                                               (with-simple-restart (cl:abort "Exit debugger, returning to top level.")
+                                                                                 (eval expr)))))))
+    (setq common-lisp-user::*** common-lisp-user::**
+          common-lisp-user::** common-lisp-user::*
+          common-lisp-user::* (car evaluated-expr)
+          common-lisp-user::/// common-lisp-user:://
+          common-lisp-user::// common-lisp-user::/
+          common-lisp-user::/ evaluated-expr
+          common-lisp-user::+++ common-lisp-user::++
+          common-lisp-user::++ common-lisp-user::+
+          common-lisp-user::+ expr)
+    (remove nil (mapcar #'jupyter:make-lisp-result evaluated-expr))))
 
 (defmethod jupyter:evaluate-code ((k kernel) code)
   (iter
