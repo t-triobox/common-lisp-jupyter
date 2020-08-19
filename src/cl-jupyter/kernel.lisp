@@ -49,6 +49,7 @@
       (finish-output *error-output*)
       (conium:call-with-debugging-environment
         (lambda ()
+          (conium:activate-stepping 0)
           (jupyter:debug-stop jupyter:*kernel* "exception" (dissect:capture-environment condition)))))
     (t
       (dissect:present condition *error-output*)
@@ -66,23 +67,19 @@
 
 
 (defmethod jupyter:debug-continue ((k kernel) environment)
-  #+sbcl (invoke-restart 'sb-impl::step-continue)
-  #-sbcl (continue (dissect:environment-condition environment)))
+  (continue))
 
 
 (defmethod jupyter:debug-in ((k kernel) environment)
-  #+sbcl (invoke-restart 'sb-impl::step-into)
-  #-sbcl (continue (dissect:environment-condition environment)))
+  (conium:sldb-step-into))
 
 
 (defmethod jupyter:debug-out ((k kernel) environment)
-  #+sbcl (invoke-restart 'sb-impl::step-out)
-  #-sbcl (continue (dissect:environment-condition environment)))
+  (conium:sldb-step-out))
 
 
 (defmethod jupyter:debug-next ((k kernel) environment)
-  #+sbcl (invoke-restart 'sb-impl::step-next)
-  #-sbcl (error "no stepping"))
+  (conium:sldb-step-next))
 
 
 (defmethod jupyter:debug-scopes ((k kernel) environment frame)
@@ -92,17 +89,16 @@
 (defmethod jupyter:debug-stack-trace ((k kernel) environment)
   (let (results)
     (jupyter::dolist* (frame-number frame (conium:compute-backtrace 0 nil) (nreverse results))
-      ;(format :error k "~S" (conium:frame-source-location-for-emacs frame-number))
-                     (push (jupyter:json-new-obj
-                             ("id" (jupyter:add-debug-object k frame))
-                             ("name" (with-output-to-string (s)
-                                       (conium:print-frame frame s)))
-                             ("source" (jupyter:json-new-obj
-                                          ("name" "foo")
-                                          ("path" "foo")))
-                             ("line" 0)
-                             ("column" 0))
-                           results))))
+      (push (jupyter:json-new-obj
+              ("id" (jupyter:add-debug-object k frame))
+              ("name" (with-output-to-string (s)
+                        (conium:print-frame frame s)))
+              ; ("source" (jupyter:json-new-obj
+              ;              ("name" (format nil "~S" (conium:frame-source-location-for-emacs frame-number)))
+              ;              ("path" (format nil "~S" (conium:frame-source-location-for-emacs frame-number)))))
+              ("line" 0)
+              ("column" 0))
+            results))))
 
 
 (defmethod jupyter:debug-initialize ((k kernel))
